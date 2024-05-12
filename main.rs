@@ -71,22 +71,31 @@ async fn main() -> Result<(), DynError> {
     client.lock().await.execute(&create_table_sql, &[]).await?;
     let stmt = client.lock().await.prepare(&insert_statement).await?;
 
-    while let Some(maybe_batch) = arrow_reader.get_record_reader(2048)?.next() {
-        let batch = maybe_batch?;
-        let sem_clone = sem.clone();
-        let client_clone = client.clone();
-        let stmt_clone = stmt.clone();
+    let mut record_reader = arrow_reader.get_record_reader(2048)?;
 
-        let future = task::spawn(async move {
-            let _permit = sem_clone.acquire().await.unwrap();
-            let locked_client = client_clone.lock().await;
-            insert_batch(&*locked_client, &stmt_clone, &batch).await.unwrap();
-        });
-
-        futures.push(future);
+    while let Some(batch_result) = record_reader.next() {
+        match batch_result {
+            Ok(batch) => {
+                let sem_clone = sem.clone();
+                let client_clone = client.clone();
+                let stmt_clone = stmt.clone();
+                let future = task::spawn(async move {
+                    let _permit = sem_clone.acquire().await.expect("Failed to acquire semaphore");
+                    let locked_client = client_clone.lock().await;
+                    insert_batch(&*locked_client, &stmt_clone, &batch)
+                        .await
+                        .expect("Failed to insert batch");
+                });
+                futures.push(future);
+            },
+            Err(e) => {
+                eprintln!("Failed to read batch: {:?}", e);
+                break;
+            }
+        }
     }
-
-    join_all(futures).await; // Proper error handling should be added here.
+    
+    join_all(futures).await;
 
     println!("Time taken: {:?}", start.elapsed());
     Ok(())
