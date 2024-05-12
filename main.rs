@@ -27,6 +27,8 @@
 // Acknowledgment appreciated but not required.
 // --------------------------------------------------------------------------------
 
+use bb8::Pool;
+use bb8_postgres::PostgresConnectionManager;
 use std::fs::File;
 use std::sync::Arc;
 use arrow::array::{
@@ -37,13 +39,16 @@ use arrow::datatypes::{Schema, DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::{ArrowReader, ParquetFileArrowReader};
 use parquet::file::reader::SerializedFileReader;
-use tokio::sync::{Semaphore, Mutex};
+use tokio::sync::Semaphore;
 use tokio_postgres::{NoTls, Client, Error as PgError};
 use tokio::task;
 use futures::future::join_all;
 use tokio_postgres::types::ToSql;
+use tokio_postgres::Config;
 
-type DynError = Box<dyn std::error::Error + Send + Sync>;
+use std::error::Error;
+
+type DynError = Box<dyn Error + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
@@ -54,37 +59,46 @@ async fn main() -> Result<(), DynError> {
 
     let arrow_schema = arrow_reader.get_schema()?;
     let table_name = "tommy";
-    let create_table_sql = generate_create_table_sql(table_name, &arrow_schema)?;
-    let insert_statement = generate_insert_statement(table_name, &arrow_schema)?;
+    let create_table_sql = generate_create_table_sql(&table_name, &arrow_schema)?;
+    let insert_statement = generate_insert_statement(&table_name, &arrow_schema)?;
 
-    let (client, connection) = tokio_postgres::connect("host=localhost user=postgres password=password dbname=tfmv", NoTls).await?;
-    let client = Arc::new(Mutex::new(client));
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("Connection error: {}", e);
-        }
-    });
+    // Connection Pool Setup
+    let mut config = Config::new();
+    config.host("localhost");
+    config.user("postgres");
+    config.password("password");
+    config.dbname("tfmv");
+    let manager = PostgresConnectionManager::new(config, NoTls);
+    let pool = Pool::builder().build(manager).await?;
 
     let sem = Arc::new(Semaphore::new(10)); // Control concurrency
     let mut futures = vec![];
 
-    client.lock().await.execute(&create_table_sql, &[]).await?;
-    let stmt = client.lock().await.prepare(&insert_statement).await?;
+    // Assuming you have only one client that starts the connection
+    let conn = pool.get().await?;
+    conn.execute(&create_table_sql, &[]).await?;
 
-    let mut record_reader = arrow_reader.get_record_reader(2048)?;
+    let mut record_reader = arrow_reader.get_record_reader(10000)?;
 
     while let Some(batch_result) = record_reader.next() {
         match batch_result {
             Ok(batch) => {
                 let sem_clone = sem.clone();
-                let client_clone = client.clone();
-                let stmt_clone = stmt.clone();
+                let pool_clone = pool.clone();
+                let stmt_clone = insert_statement.clone();
+
                 let future = task::spawn(async move {
                     let _permit = sem_clone.acquire().await.expect("Failed to acquire semaphore");
-                    let locked_client = client_clone.lock().await;
-                    insert_batch(&*locked_client, &stmt_clone, &batch)
-                        .await
-                        .expect("Failed to insert batch");
+
+                    let conn = pool_clone.get().await.expect("Failed to get a connection");
+                    match conn.prepare(&stmt_clone).await {
+                        Ok(stmt) => {
+                            if let Err(e) = insert_batch(&conn, &stmt, &batch).await {
+                                eprintln!("Failed to insert batch: {:?}", e);
+                            }
+                        },
+                        Err(e) => eprintln!("Failed to prepare statement: {:?}", e),
+                    }
                 });
                 futures.push(future);
             },
@@ -127,7 +141,6 @@ async fn insert_batch(client: &Client, stmt: &tokio_postgres::Statement, batch: 
         let row_values = batch.columns().iter().map(|col| {
             arrow_to_postgres(col, row).expect("Failed to convert Arrow data to SQL data")
         }).collect::<Vec<_>>();
-
         client.execute(stmt, &row_values.iter().map(|v| v.as_ref() as &(dyn ToSql + Sync)).collect::<Vec<_>>()).await?;
     }
     Ok(())
@@ -157,7 +170,7 @@ fn arrow_to_postgres<'a>(column: &'a ArrayRef, row: usize) -> Result<Box<dyn ToS
         },
         DataType::Float32 => {
             column.as_any().downcast_ref::<Float32Array>()
-                .map(|array| Box::new(f64::from(array.value(row))) as Box<dyn ToSql + Sync + Send>)  // Cast to f64
+                .map(|array| Box::new(f64::from(array.value(row))) as Box<dyn ToSql + Sync + Send>)
                 .ok_or_else(|| "Failed to downcast Float32Array".to_string())
         },
         DataType::Float64 => {
@@ -188,3 +201,4 @@ fn arrow_to_postgres<'a>(column: &'a ArrayRef, row: usize) -> Result<Box<dyn ToS
         _ => Err(format!("Unsupported data type: {:?}", column.data_type()))
     }
 }
+

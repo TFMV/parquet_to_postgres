@@ -14,6 +14,10 @@ tokio = { version = "1", features = ["full", "macros"] }
 tokio-postgres = "0.7"
 futures = "0.3"
 
+# Connection pooling
+bb8 = "0.7" # Check for the latest version suitable for your needs
+bb8-postgres = "0.7" # Ensure compatibility with tokio-postgres versions
+
 # SQL parsing
 sqlparser = "0.13.0"
 
@@ -21,4 +25,3 @@ sqlparser = "0.13.0"
 serde = "1.0"
 serde_json = "1.0"
 serde_derive = "1.0"
-
