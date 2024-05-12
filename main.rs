@@ -27,116 +27,155 @@
 // Acknowledgment appreciated but not required.
 // --------------------------------------------------------------------------------
 
-use futures::future::join_all;
-use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::RowAccessor;
 use std::fs::File;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
-use tokio::time::Instant;
+use arrow::array::{
+    ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, Float32Array, Float64Array,
+    StringArray, Date32Array, Date64Array, TimestampNanosecondArray
+};
+use arrow::datatypes::{Schema, DataType, TimeUnit};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::{ArrowReader, ParquetFileArrowReader};
+use parquet::file::reader::SerializedFileReader;
+use tokio::sync::{Semaphore, Mutex};
+use tokio_postgres::{NoTls, Client, Error as PgError};
 use tokio::task;
-use tokio_postgres::{NoTls, types::ToSql};
+use futures::future::join_all;
+use tokio_postgres::types::ToSql;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
-    let start = Instant::now();
+    let start = std::time::Instant::now();
+    let file = File::open("data/flights.parquet")?;
+    let file_reader = SerializedFileReader::new(file)?;
+    let mut arrow_reader = ParquetFileArrowReader::new(Arc::new(file_reader));
 
-    let file = File::open("data/data.parquet")?;
-    let reader = SerializedFileReader::new(file)?;
-    let schema_descr = reader.metadata().file_metadata().schema_descr();
-
-    let table_name = "pq";
-    let create_table_sql = generate_create_table_sql(table_name, &schema_descr)?;
+    let arrow_schema = arrow_reader.get_schema()?;
+    let table_name = "tommy";
+    let create_table_sql = generate_create_table_sql(table_name, &arrow_schema)?;
+    let insert_statement = generate_insert_statement(table_name, &arrow_schema)?;
 
     let (client, connection) = tokio_postgres::connect("host=localhost user=postgres password=password dbname=tfmv", NoTls).await?;
-    let client = Arc::new(client);
-
+    let client = Arc::new(Mutex::new(client));
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("Connection error: {}", e);
         }
     });
 
-    client.execute(&create_table_sql, &[]).await?;
-
-    let stmt = client.prepare(&format!("INSERT INTO {} VALUES ({})", table_name, placeholders_from_schema(&schema_descr))).await?;
-
-    let sem = Arc::new(Semaphore::new(10));
+    let sem = Arc::new(Semaphore::new(10)); // Control concurrency
     let mut futures = vec![];
-    let mut count = 0;
 
-    for row in reader.get_row_iter(None)? {
-        let client = Arc::clone(&client);
-        let stmt = stmt.clone();
-        let permit = sem.clone().acquire_owned().await;
-        let row_values = row_to_sql_values(&row, &schema_descr)?;
+    client.lock().await.execute(&create_table_sql, &[]).await?;
+    let stmt = client.lock().await.prepare(&insert_statement).await?;
+
+    while let Some(maybe_batch) = arrow_reader.get_record_reader(2048)?.next() {
+        let batch = maybe_batch?;
+        let sem_clone = sem.clone();
+        let client_clone = client.clone();
+        let stmt_clone = stmt.clone();
+
         let future = task::spawn(async move {
-            let _permit = permit;
-            let result = client.execute(
-                &stmt, 
-                &row_values.iter().map(|v| v.as_ref() as &(dyn ToSql + Sync)).collect::<Vec<&(dyn ToSql + Sync)>>()
-            ).await;
-            if let Err(e) = result {
-                eprintln!("Error inserting row: {}", e);
-            }
-            Ok::<(), DynError>(())
+            let _permit = sem_clone.acquire().await.unwrap();
+            let locked_client = client_clone.lock().await;
+            insert_batch(&*locked_client, &stmt_clone, &batch).await.unwrap();
         });
-    
-        futures.push(future);
-        count += 1;
-        if count % 1000 == 0 {
-            let _: Vec<_> = join_all(futures).await.into_iter().collect::<Result<Vec<_>, _>>()?;
-            futures = Vec::new();
-        }
-    }   
 
-    if !futures.is_empty() {
-        let _: Vec<_> = join_all(futures).await.into_iter().collect::<Result<Vec<_>, _>>()?;
+        futures.push(future);
     }
 
-    println!("Total rows: {}", count);
+    join_all(futures).await; // Proper error handling should be added here.
+
     println!("Time taken: {:?}", start.elapsed());
     Ok(())
 }
 
-fn placeholders_from_schema(schema: &parquet::schema::types::SchemaDescriptor) -> String {
-    (1..=schema.columns().len()).map(|i| format!("${}", i)).collect::<Vec<_>>().join(", ")
-}
-
-fn row_to_sql_values(row: &parquet::record::Row, schema: &parquet::schema::types::SchemaDescriptor) -> Result<Vec<Box<dyn ToSql + Sync + Send>>, DynError> {
-    let mut values = Vec::new();
-    for (i, col) in schema.columns().iter().enumerate() {
-        let value: Box<dyn ToSql + Sync + Send> = match col.physical_type() {
-            parquet::basic::Type::BOOLEAN => Box::new(row.get_bool(i).unwrap_or_default()),
-            parquet::basic::Type::INT32 => Box::new(row.get_int(i).unwrap_or_default()),
-            parquet::basic::Type::INT64 => Box::new(row.get_long(i).unwrap_or_default()),
-            parquet::basic::Type::FLOAT => Box::new(row.get_float(i).map(|f| f as f64).unwrap_or_default()),  // Convert f32 to f64
-            parquet::basic::Type::DOUBLE => Box::new(row.get_double(i).unwrap_or_default()),
-            parquet::basic::Type::BYTE_ARRAY => Box::new(row.get_string(i).map(|s| s.to_string()).unwrap_or_else(|_| "".to_string())),
-            _ => Box::new("Unsupported type")
-        };
-        values.push(value);
-    }
-    Ok(values)
-}
-
-fn generate_create_table_sql(table_name: &str, schema: &parquet::schema::types::SchemaDescriptor) -> Result<String, DynError> {
-    let columns_sql = schema.columns().iter().map(|col| {
-        let col_name = col.name();
-        let data_type = match col.physical_type() {
-            parquet::basic::Type::BOOLEAN => "BOOLEAN",
-            parquet::basic::Type::INT32 => "INT",
-            parquet::basic::Type::INT64 => "BIGINT",
-            parquet::basic::Type::FLOAT => "FLOAT",
-            parquet::basic::Type::DOUBLE => "DOUBLE PRECISION",
-            parquet::basic::Type::BYTE_ARRAY => "TEXT",
+fn generate_create_table_sql(table_name: &str, schema: &Schema) -> Result<String, DynError> {
+    let columns_sql = schema.fields().iter().map(|field| {
+        let col_name = field.name();
+        let data_type = match field.data_type() {
+            DataType::Boolean => "BOOLEAN",
+            DataType::Int32 => "INT",
+            DataType::Int64 => "BIGINT",
+            DataType::Float32 | DataType::Float64 => "FLOAT",
+            DataType::Utf8 => "TEXT",
             _ => "TEXT"
         };
         format!("{} {}", col_name, data_type)
     }).collect::<Vec<_>>().join(", ");
+    Ok(format!("CREATE TABLE IF NOT EXISTS {} ({})", table_name, columns_sql))
+}
 
-    let sql = format!("CREATE TABLE IF NOT EXISTS {} ({})", table_name, columns_sql);
-    Ok(sql)
+fn generate_insert_statement(table_name: &str, schema: &Schema) -> Result<String, DynError> {
+    let placeholders = schema.fields().iter().enumerate().map(|(i, _)| format!("${}", i + 1)).collect::<Vec<_>>().join(", ");
+    Ok(format!("INSERT INTO {} VALUES ({})", table_name, placeholders))
+}
+
+async fn insert_batch(client: &Client, stmt: &tokio_postgres::Statement, batch: &RecordBatch) -> Result<(), PgError> {
+    for row in 0..batch.num_rows() {
+        let row_values = batch.columns().iter().map(|col| {
+            arrow_to_postgres(col, row).expect("Failed to convert Arrow data to SQL data")
+        }).collect::<Vec<_>>();
+
+        client.execute(stmt, &row_values.iter().map(|v| v.as_ref() as &(dyn ToSql + Sync)).collect::<Vec<_>>()).await?;
+    }
+    Ok(())
+}
+
+fn arrow_to_postgres<'a>(column: &'a ArrayRef, row: usize) -> Result<Box<dyn ToSql + Sync + Send + 'a>, String> {
+    match column.data_type() {
+        DataType::Boolean => {
+            column.as_any().downcast_ref::<BooleanArray>()
+                .map(|array| Box::new(array.value(row)) as Box<dyn ToSql + Sync + Send>)
+                .ok_or_else(|| "Failed to downcast BooleanArray".to_string())
+        },
+        DataType::Int16 => {
+            column.as_any().downcast_ref::<Int16Array>()
+                .map(|array| Box::new(i32::from(array.value(row))) as Box<dyn ToSql + Sync + Send>)
+                .ok_or_else(|| "Failed to downcast Int16Array".to_string())
+        },
+        DataType::Int32 => {
+            column.as_any().downcast_ref::<Int32Array>()
+                .map(|array| Box::new(array.value(row)) as Box<dyn ToSql + Sync + Send>)
+                .ok_or_else(|| "Failed to downcast Int32Array".to_string())
+        },
+        DataType::Int64 => {
+            column.as_any().downcast_ref::<Int64Array>()
+                .map(|array| Box::new(array.value(row)) as Box<dyn ToSql + Sync + Send>)
+                .ok_or_else(|| "Failed to downcast Int64Array".to_string())
+        },
+        DataType::Float32 => {
+            column.as_any().downcast_ref::<Float32Array>()
+                .map(|array| Box::new(f64::from(array.value(row))) as Box<dyn ToSql + Sync + Send>)  // Cast to f64
+                .ok_or_else(|| "Failed to downcast Float32Array".to_string())
+        },
+        DataType::Float64 => {
+            column.as_any().downcast_ref::<Float64Array>()
+                .map(|array| Box::new(array.value(row)) as Box<dyn ToSql + Sync + Send>)
+                .ok_or_else(|| "Failed to downcast Float64Array".to_string())
+        },
+        DataType::Utf8 => {
+            column.as_any().downcast_ref::<StringArray>()
+                .map(|array| Box::new(array.value(row).to_string()) as Box<dyn ToSql + Sync + Send>)
+                .ok_or_else(|| "Failed to downcast StringArray".to_string())
+        },
+        DataType::Date32 => {
+            column.as_any().downcast_ref::<Date32Array>()
+                .map(|array| Box::new(array.value(row)) as Box<dyn ToSql + Sync + Send>)
+                .ok_or_else(|| "Failed to downcast Date32Array".to_string())
+        },
+        DataType::Date64 => {
+            column.as_any().downcast_ref::<Date64Array>()
+                .map(|array| Box::new(array.value(row)) as Box<dyn ToSql + Sync + Send>)
+                .ok_or_else(|| "Failed to downcast Date64Array".to_string())
+        },
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+            column.as_any().downcast_ref::<TimestampNanosecondArray>()
+                .map(|array| Box::new(array.value(row)) as Box<dyn ToSql + Sync + Send>)
+                .ok_or_else(|| "Failed to downcast TimestampNanosecondArray".to_string())
+        },
+        _ => Err(format!("Unsupported data type: {:?}", column.data_type()))
+    }
 }
