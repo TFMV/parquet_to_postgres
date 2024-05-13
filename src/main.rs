@@ -29,9 +29,6 @@
 
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
-use futures::channel::mpsc;
-use futures::stream::StreamExt;
-use futures::SinkExt;
 use std::fs::File;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -57,9 +54,8 @@ async fn main() -> Result<(), DynError> {
     let mut arrow_reader = ParquetFileArrowReader::new(Arc::new(file_reader));
 
     let arrow_schema = arrow_reader.get_schema()?;
-    let table_name = "tommy";
+    let table_name = "flights";
     let create_table_sql = generate_create_table_sql(&table_name, &arrow_schema)?;
-    let insert_statement = generate_insert_statement(&table_name, &arrow_schema)?;
 
     let mut config = Config::new();
     config.host("localhost");
@@ -75,26 +71,20 @@ async fn main() -> Result<(), DynError> {
     let conn = pool.get().await?;
     conn.execute(&create_table_sql, &[]).await?;
 
-    let mut record_reader = arrow_reader.get_record_reader(10000)?;
-
+    let mut record_reader = arrow_reader.get_record_reader(1000)?;
     while let Some(batch_result) = record_reader.next() {
         match batch_result {
             Ok(batch) => {
                 let sem_clone = sem.clone();
                 let pool_clone = pool.clone();
-                let stmt_clone = insert_statement.clone();
-
+                let arrow_schema_clone = arrow_schema.clone();
+                let table_name_clone = table_name.to_string();
+    
                 let future = task::spawn(async move {
                     let _permit = sem_clone.acquire().await.expect("Failed to acquire semaphore");
-
                     let conn = pool_clone.get().await.expect("Failed to get a connection");
-                    match conn.prepare(&stmt_clone).await {
-                        Ok(stmt) => {
-                            if let Err(e) = insert_batch(&conn, &stmt, &batch).await {
-                                eprintln!("Failed to insert batch: {:?}", e);
-                            }
-                        },
-                        Err(e) => eprintln!("Failed to prepare statement: {:?}", e),
+                    if let Err(e) = insert_batch(&conn, &batch, &arrow_schema_clone, &table_name_clone).await {
+                        eprintln!("Failed to insert batch: {:?}", e);
                     }
                 });
                 futures.push(future);
@@ -107,7 +97,6 @@ async fn main() -> Result<(), DynError> {
     }
     
     join_all(futures).await;
-
     println!("Time taken: {:?}", start.elapsed());
     Ok(())
 }
@@ -128,18 +117,36 @@ fn generate_create_table_sql(table_name: &str, schema: &Schema) -> Result<String
     Ok(format!("CREATE TABLE IF NOT EXISTS {} ({})", table_name, columns_sql))
 }
 
-fn generate_insert_statement(table_name: &str, schema: &Schema) -> Result<String, DynError> {
-    let placeholders = schema.fields().iter().enumerate().map(|(i, _)| format!("${}", i + 1)).collect::<Vec<_>>().join(", ");
-    Ok(format!("INSERT INTO {} VALUES ({})", table_name, placeholders))
-}
-
-async fn insert_batch(client: &Client, stmt: &tokio_postgres::Statement, batch: &RecordBatch) -> Result<(), PgError> {
-    for row in 0..batch.num_rows() {
-        let row_values = batch.columns().iter().map(|col| {
-            arrow_to_postgres(col, row).expect("Failed to convert Arrow data to SQL data")
-        }).collect::<Vec<_>>();
-        client.execute(stmt, &row_values.iter().map(|v| v.as_ref() as &(dyn ToSql + Sync)).collect::<Vec<_>>()).await?;
+async fn insert_batch(client: &Client, batch: &RecordBatch, schema: &Schema, table_name: &str) -> Result<(), PgError> {
+    if batch.num_rows() == 0 {
+        return Ok(());
     }
+
+    // Placeholder and parameter collection
+    let mut all_rows_placeholders = Vec::new();
+    let mut all_parameters = Vec::new();
+
+    // Generate placeholders for each row and collect parameters
+    for row in 0..batch.num_rows() {
+        let row_placeholders: Vec<String> = schema.fields().iter().enumerate().map(|(i, _)| {
+            format!("${}", i + 1 + row * schema.fields().len())  // Unique placeholder per field across all rows
+        }).collect();
+
+        // Append current row's placeholders in the format required for SQL
+        all_rows_placeholders.push(format!("({})", row_placeholders.join(", ")));
+
+        // Collect parameters for the current row
+        for col in batch.columns() {
+            let value = arrow_to_postgres(col, row).expect("Failed to convert Arrow data to SQL data");
+            all_parameters.push(value);
+        }
+    }
+
+    // Construct the complete SQL statement
+    let insert_statement = format!("INSERT INTO {} VALUES {}", table_name, all_rows_placeholders.join(", "));
+
+    // Execute the query
+    client.execute(&insert_statement, &all_parameters.iter().map(|v| v.as_ref() as &(dyn ToSql + Sync)).collect::<Vec<_>>()).await?;
     Ok(())
 }
 
@@ -182,19 +189,22 @@ fn arrow_to_postgres<'a>(column: &'a ArrayRef, row: usize) -> Result<Box<dyn ToS
         },
         DataType::Date32 => {
             column.as_any().downcast_ref::<Date32Array>()
-                .map(|array| Box::new(array.value(row)) as Box<dyn ToSql + Sync + Send>)
+                .map(|array| Box::new(array.value(row) as i32) as Box<dyn ToSql + Sync + Send>)
                 .ok_or_else(|| "Failed to downcast Date32Array".to_string())
         },
         DataType::Date64 => {
             column.as_any().downcast_ref::<Date64Array>()
-                .map(|array| Box::new(array.value(row)) as Box<dyn ToSql + Sync + Send>)
+                .map(|array| Box::new(array.value(row) as i64) as Box<dyn ToSql + Sync + Send>)
                 .ok_or_else(|| "Failed to downcast Date64Array".to_string())
         },
         DataType::Timestamp(TimeUnit::Nanosecond, None) => {
             column.as_any().downcast_ref::<TimestampNanosecondArray>()
-                .map(|array| Box::new(array.value(row)) as Box<dyn ToSql + Sync + Send>)
+                .map(|array| Box::new(array.value(row) as i64) as Box<dyn ToSql + Sync + Send>)
                 .ok_or_else(|| "Failed to downcast TimestampNanosecondArray".to_string())
         },
-        _ => Err(format!("Unsupported data type: {:?}", column.data_type()))
+        _ => {
+            eprintln!("Unsupported data type: {:?}", column.data_type());
+            Err(format!("Unsupported data type: {:?}", column.data_type()))
+        }
     }
 }
