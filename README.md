@@ -19,6 +19,10 @@ This Rust application seamlessly transfers data from Parquet files into a Postgr
 2. **Configure Database Connection**: Modify the database connection string in the source code to match your database server's credentials and address.
 3. **Run the Application**: Place your Parquet file in the designated directory and run the application. The data will be automatically imported into the specified PostgreSQL database.
 
+## Data Flow
+
+![PQ to PG](pq_to_pg.png)
+
 ## License
 
 This project is open-source and available under the MIT License. For more details, see the included LICENSE file or visit [MIT License](https://opensource.org/licenses/MIT).
