@@ -1,5 +1,7 @@
 # Parquet to PostgreSQL Importer
 
+![PQ to PG](pqpg.webp)
+
 ## About
 
 This Rust application seamlessly transfers data from Parquet files into a PostgreSQL database. Crafted by Thomas F McGeehan V, this tool is designed for efficiency and ease of use, enabling rapid integration of complex data structures into a relational database format without losing the nuances of the original data.
